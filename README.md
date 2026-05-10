@@ -14,6 +14,36 @@ VM:
 - Handles HVC traps so the guest can call back into the VMM
 - Reports data / instruction aborts and unknown exceptions cleanly
 
+## Quick start
+
+```bash
+./scripts/run-vm.sh
+```
+
+That's it. The script builds the hypervisor and the bundled aarch64 demo
+guest if needed, ad-hoc-signs the binary with the hypervisor entitlement,
+spins up a microVM, and prints:
+
+```
+Hello from the chubby-cat microVM guest!
+```
+
+Other ways to use the script:
+
+```bash
+# boot a custom flat-binary guest
+./scripts/run-vm.sh path/to/payload.bin
+
+# pass options through to chubby-cat (after `--`)
+./scripts/run-vm.sh -- --mem 128 -v
+
+# combine: custom payload + custom options
+./scripts/run-vm.sh path/to/payload.bin -- --mem 128 --entry 0x80000000 -v
+```
+
+The script is idempotent — re-runs reuse the existing build, and rebuild
+only when source files in `src/` are newer than `build/chubby-cat`.
+
 ## Requirements
 
 - macOS 11+ on **Apple Silicon** (arm64 only)
@@ -42,6 +72,9 @@ Either build step ad-hoc-signs the binary with the
 `Hypervisor.framework`).
 
 ## Run
+
+The fastest path is `./scripts/run-vm.sh` (see [Quick start](#quick-start)
+above). Equivalent direct invocation:
 
 ```bash
 ./build/chubby-cat examples/hello.bin
