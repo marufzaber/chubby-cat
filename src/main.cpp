@@ -1,3 +1,8 @@
+// main.cpp — chubby-cat CLI entry point.
+//
+// Parses arguments, builds a VM with one RAM region, loads a flat-binary
+// payload at the guest entry address, and runs a single vCPU until it exits.
+
 #include "vcpu.hpp"
 #include "vm.hpp"
 
@@ -9,11 +14,12 @@
 
 namespace chubby {
 
+// Parsed command-line configuration. Defaults match the README.
 struct Args {
     std::string payload;
     uint64_t    mem_bytes = 64ull * 1024ull * 1024ull;
     uint64_t    entry_pa  = 0x80000000ull;
-    uint64_t    stack_top = 0;  // 0 means "default to top of RAM".
+    uint64_t    stack_top = 0;  // 0 sentinel: defer to "top of RAM" default.
     bool        verbose   = false;
 };
 
@@ -36,10 +42,12 @@ void print_usage(const char* prog) {
         "  HVC #3: puts     (x0 = guest_pa, x1 = length)\n";
 }
 
+// std::stoull with auto base detection (decimal, 0x.., 0..).
 static uint64_t parse_u64(const std::string& s) {
     return std::stoull(s, nullptr, 0);
 }
 
+// Returns 0 on success, 1 if --help was requested, 2 on a usage error.
 int parse_args(int argc, char** argv, Args& out) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];

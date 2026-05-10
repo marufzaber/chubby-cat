@@ -1,3 +1,11 @@
+// vcpu.cpp — vCPU configuration, run loop, exception decoding.
+//
+// On Apple Silicon, Hypervisor.framework runs guest code at EL1 while the VMM
+// (this process) sits at EL2. `hv_vcpu_run` returns when the guest takes a
+// trap to EL2; ESR_EL2 (exposed via hv_vcpu_exit_t::exception.syndrome) tells
+// us why. We decode ESR.EC, handle HVCs ourselves, and surface anything else
+// as a fatal error.
+
 #include "vcpu.hpp"
 
 #include "vm.hpp"
@@ -11,6 +19,7 @@ namespace chubby {
 
 namespace {
 
+// Throw a descriptive runtime_error if a Hypervisor.framework call failed.
 void check(hv_return_t r, const char* what) {
     if (r != HV_SUCCESS) {
         std::ostringstream oss;
@@ -19,7 +28,9 @@ void check(hv_return_t r, const char* what) {
     }
 }
 
-// PSTATE/CPSR bits for an EL1h entry with all interrupts masked.
+// PSTATE/CPSR layout used for the initial entry. We boot the guest in EL1h
+// (the EL1 mode that uses SP_EL1 as its stack) with all asynchronous
+// exceptions masked: D=Debug, A=SError, I=IRQ, F=FIQ.
 constexpr uint64_t kPsrModeEL1h = 0x5;
 constexpr uint64_t kPsrF        = 1ull << 6;
 constexpr uint64_t kPsrI        = 1ull << 7;
@@ -27,16 +38,19 @@ constexpr uint64_t kPsrA        = 1ull << 8;
 constexpr uint64_t kPsrD        = 1ull << 9;
 constexpr uint64_t kInitialCpsr = kPsrModeEL1h | kPsrF | kPsrI | kPsrA | kPsrD;
 
-// ESR_EL2.EC values we care about.
-constexpr uint32_t kEcHvcAArch64        = 0x16;
-constexpr uint32_t kEcDataAbortLowerEL  = 0x24;
-constexpr uint32_t kEcDataAbortSameEL   = 0x25;
-constexpr uint32_t kEcInstAbortLowerEL  = 0x20;
+// Selected ESR_EL2.EC (Exception Class) values from the AArch64 ARM ARM.
+// Used to demux which kind of trap brought us back to EL2.
+constexpr uint32_t kEcHvcAArch64       = 0x16;  // HVC executed in AArch64 state
+constexpr uint32_t kEcInstAbortLowerEL = 0x20;  // Instruction abort from a lower EL
+constexpr uint32_t kEcDataAbortLowerEL = 0x24;  // Data abort from a lower EL
+constexpr uint32_t kEcDataAbortSameEL  = 0x25;  // Data abort from EL2 (shouldn't occur here)
 
-// Custom HVC ABI used by guests of chubby-cat.
-constexpr uint16_t kHvcPutchar = 0x1;
-constexpr uint16_t kHvcExit    = 0x2;
-constexpr uint16_t kHvcPuts    = 0x3;
+// chubby-cat's custom HVC ABI. The HVC immediate (low 16 bits of ESR) selects
+// the call; arguments are in x0..x1. To extend the ABI, add a new immediate
+// here and a matching case in handle_hvc().
+constexpr uint16_t kHvcPutchar = 0x1;  // x0 = byte
+constexpr uint16_t kHvcExit    = 0x2;  // x0 = exit code (low 8 bits)
+constexpr uint16_t kHvcPuts    = 0x3;  // x0 = guest_pa, x1 = length
 
 }  // namespace
 
@@ -48,7 +62,8 @@ VCPU::VCPU(VM& vm, uint64_t entry_pc, uint64_t stack_top, bool verbose)
     set_reg(HV_REG_PC, entry_pc);
     set_sysreg(HV_SYS_REG_SP_EL1, stack_top);
 
-    // Allow guest FP/SIMD without trapping (CPACR_EL1.FPEN = 0b11).
+    // CPACR_EL1.FPEN = 0b11: don't trap FP/SIMD at EL1. Without this even
+    // basic compiler-emitted FP usage in the guest would trap to EL2.
     set_sysreg(HV_SYS_REG_CPACR_EL1, 0x300000);
 
     if (verbose_) {
@@ -85,9 +100,11 @@ int VCPU::run() {
                 running = handle_exception();
                 break;
             case HV_EXIT_REASON_VTIMER_ACTIVATED:
-                // Nothing to do until the guest waits on the virtual timer.
+                // Virtual timer asserted while running. With no GIC emulation
+                // here we have nothing to inject — just resume the vCPU.
                 break;
             case HV_EXIT_REASON_CANCELED:
+                // Triggered by hv_vcpus_exit() from another thread.
                 if (verbose_) std::cerr << "[vmm] run cancelled\n";
                 running = false;
                 break;
@@ -110,6 +127,9 @@ bool VCPU::handle_exception() {
 
     switch (ec) {
         case kEcHvcAArch64: {
+            // ESR.ISS[15:0] holds the HVC immediate. ELR_EL2 has already been
+            // advanced past the HVC instruction by hardware, so resuming
+            // naturally continues at the next guest instruction.
             const uint16_t imm = static_cast<uint16_t>(esr & 0xffff);
             return handle_hvc(imm);
         }
@@ -149,6 +169,9 @@ bool VCPU::handle_hvc(uint16_t imm) {
             return false;
         }
         case kHvcPuts: {
+            // The guest passes a guest-physical pointer; with the MMU off it
+            // is also the guest-virtual address. Resolve it to a host pointer
+            // before doing any I/O so we never dereference guest memory raw.
             const uint64_t pa  = reg(HV_REG_X0);
             const uint64_t len = reg(HV_REG_X1);
             void*          p   = vm_.host_ptr(pa, static_cast<size_t>(len));

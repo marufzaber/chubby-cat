@@ -1,3 +1,5 @@
+// vm.cpp — implementation of VM (see vm.hpp).
+
 #include "vm.hpp"
 
 #include <Hypervisor/Hypervisor.h>
@@ -13,6 +15,7 @@ namespace chubby {
 
 namespace {
 
+// Throw a descriptive runtime_error if a Hypervisor.framework call failed.
 void check(hv_return_t r, const char* what) {
     if (r != HV_SUCCESS) {
         std::ostringstream oss;
@@ -21,7 +24,10 @@ void check(hv_return_t r, const char* what) {
     }
 }
 
-constexpr size_t kPageSize = 16384;  // Apple Silicon page size.
+// Apple Silicon's hardware page size. hv_vm_map enforces this alignment for
+// both the host pointer (mmap returns 16 KiB-aligned pages by default) and
+// the guest physical address.
+constexpr size_t kPageSize = 16384;
 
 }  // namespace
 
@@ -31,6 +37,7 @@ VM::VM(bool verbose) : verbose_(verbose) {
 }
 
 VM::~VM() {
+    // Reverse of add_ram: unmap from the guest, then release the host mmap.
     for (auto& r : regions_) {
         hv_vm_unmap(r.guest_pa, r.size);
         munmap(r.host_addr, r.size);
@@ -48,6 +55,9 @@ void VM::add_ram(uint64_t guest_pa, size_t size) {
     if (mem == MAP_FAILED) throw std::runtime_error("mmap failed for guest RAM");
     std::memset(mem, 0, size);
 
+    // RWX from the guest's perspective. Tighter per-region permissions are
+    // possible (e.g. RO for a kernel image), but one combined region is
+    // simpler for the bare-metal payload case.
     check(hv_vm_map(mem, guest_pa, size,
                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC),
           "hv_vm_map");
